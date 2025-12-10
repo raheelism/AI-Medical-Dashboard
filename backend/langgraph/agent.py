@@ -8,12 +8,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from langgraph.graph import StateGraph, END
-from langchain_groq import ChatGroq
 from langchain_core.messages import SystemMessage, HumanMessage
 from backend.db.connection import get_db_connection
 from backend.api.websocket import manager
 import json
 import asyncio
+from groq import Groq
 
 # --- State Definition ---
 class AgentState(TypedDict):
@@ -38,12 +38,105 @@ if not GROQ_API_KEY:
 # Create custom HTTP client with SSL verification disabled (for corporate networks)
 http_client = httpx.Client(verify=False)
 
-llm = ChatGroq(
-    temperature=0.1,  # Slight temperature for more natural responses
-    model_name="meta-llama/llama-4-scout-17b-16e-instruct",  # Using latest Llama 4 Scout model
-    api_key=GROQ_API_KEY,
-    http_client=http_client
-)
+# Initialize native Groq client for Compound model support with custom HTTP client
+groq_client = Groq(api_key=GROQ_API_KEY, http_client=http_client)
+
+# Using Groq Compound model - integrates GPT-OSS 120B and Llama 4 with web search & tools
+GROQ_MODEL = "compound-beta"  # Options: "compound-beta", "compound-beta-mini"
+
+
+class GroqLLMWrapper:
+    """Wrapper to make native Groq client compatible with LangChain-style invoke."""
+    
+    def __init__(self, client: Groq, model: str):
+        self.client = client
+        self.model = model
+    
+    def invoke(self, messages: List[Any]) -> Any:
+        """Invoke the Groq model with messages."""
+        # Convert LangChain messages to Groq format
+        groq_messages = []
+        for msg in messages:
+            if isinstance(msg, SystemMessage):
+                groq_messages.append({"role": "system", "content": msg.content})
+            elif isinstance(msg, HumanMessage):
+                groq_messages.append({"role": "user", "content": msg.content})
+            elif hasattr(msg, 'content'):
+                # Generic message with content
+                role = getattr(msg, 'type', 'user')
+                if role == 'human':
+                    role = 'user'
+                elif role == 'ai':
+                    role = 'assistant'
+                groq_messages.append({"role": role, "content": msg.content})
+        
+        # Groq Compound model requires the last message to be 'user' role
+        # If we only have system messages, convert the last one to user role
+        if groq_messages and groq_messages[-1]["role"] == "system":
+            # Move system content to a user message
+            system_content = groq_messages[-1]["content"]
+            groq_messages[-1] = {"role": "user", "content": system_content}
+        
+        # Call Groq API
+        completion = self.client.chat.completions.create(
+            model=self.model,
+            messages=groq_messages,
+            temperature=0.1
+        )
+        
+        # Return a response object with .content attribute
+        class Response:
+            def __init__(self, content):
+                self.content = self._clean_compound_response(content)
+            
+            def _clean_compound_response(self, content: str) -> str:
+                """Remove Compound model's reasoning preambles from response."""
+                import re
+                if not content:
+                    return content
+                
+                cleaned = content.strip()
+                
+                # Remove markdown bold headers like **Reasoning...** or **Summary**
+                cleaned = re.sub(r'\*\*[^*]+\*\*\s*', '', cleaned)
+                
+                # Remove lines starting with "- " that look like reasoning bullets
+                lines = cleaned.split('\n')
+                result_lines = []
+                for line in lines:
+                    stripped = line.strip()
+                    # Skip bullet points that are reasoning/meta-commentary
+                    if stripped.startswith('- ') and any(word in stripped.lower() for word in [
+                        'combining', 'therefore', 'this means', 'based on', 'from the', 
+                        'the data', 'the json', 'the result', 'the above', 'the record',
+                        'key details', 'summary', 'yields', 'earlier work', 'reasoning'
+                    ]):
+                        continue
+                    result_lines.append(line)
+                
+                cleaned = '\n'.join(result_lines).strip()
+                
+                # If still has bullet points at start, try to get just the core content
+                if cleaned.startswith('- '):
+                    # Take the text after the last bullet if it's a single line answer
+                    lines = [l for l in cleaned.split('\n') if l.strip()]
+                    if lines:
+                        # Get last non-bullet line, or strip the bullet from last line
+                        for line in reversed(lines):
+                            if not line.strip().startswith('- '):
+                                cleaned = line.strip()
+                                break
+                        else:
+                            # All lines are bullets, strip bullet from last one
+                            cleaned = lines[-1].strip()[2:].strip()
+                
+                return cleaned
+        
+        return Response(completion.choices[0].message.content)
+
+
+# Create LLM instance using the wrapper
+llm = GroqLLMWrapper(groq_client, GROQ_MODEL)
 
 # --- Helper Functions ---
 def get_current_data_context():
@@ -209,7 +302,7 @@ DATABASE SCHEMA:
 - billing (id INTEGER PRIMARY KEY AUTOINCREMENT, patient_id INTEGER, amount REAL, status TEXT, date TEXT)
   - status values: 'Pending', 'Paid', 'Overdue'
 
-CONVERSATION HISTORY (CRITICAL - use this to understand what the user is referring to):
+CONVERSATION HISTORY (CRITICAL - read carefully to understand context and previous operations):
 {history_str}
 
 CURRENT DATA CONTEXT:
@@ -217,29 +310,62 @@ CURRENT DATA CONTEXT:
 
 USER REQUEST: "{last_message}"
 
-CRITICAL CONTEXT RULES:
-1. If user says "change status to Paid" after discussing pending bills, update ALL pending bills or the specific one shown
-2. If user says "it", "that", "this one", "the same" - refer to the LAST discussed record from conversation history
-3. If history shows a query result with specific IDs, and user wants to modify "it" - use those IDs
-4. "pending bills" = SELECT * FROM billing WHERE status = 'Pending'
-5. "mark as paid" or "change to paid" = UPDATE billing SET status = 'Paid' WHERE ...
-6. When updating based on previous context, look for IDs, patient names, or conditions from the last query
+CONTEXT UNDERSTANDING RULES:
+1. READ THE CONVERSATION HISTORY CAREFULLY - it contains SQL that was executed and IDs that were affected
+2. Look for patterns like "[SQL: UPDATE billing SET status = 'Paid' WHERE id = 2]" - this tells you record ID 2 was changed
+3. "the one you just updated" / "the one I changed" / "leave that one" = the ID from the most recent UPDATE in history
+4. "change the rest" / "all except that one" = use WHERE id != (the recently updated ID)
+5. "all others" / "the remaining ones" = exclude the IDs mentioned in recent operations
 
-EXAMPLES:
-- History: "showed billing id=2 with status Pending", User: "change it to paid" -> UPDATE billing SET status = 'Paid' WHERE id = 2
-- History: "found 1 pending bill", User: "mark as paid" -> UPDATE billing SET status = 'Paid' WHERE status = 'Pending'
-- User: "show pending bills" -> SELECT * FROM billing WHERE status = 'Pending'
+CRITICAL EXAMPLES:
+- History shows "[SQL: UPDATE billing SET status = 'Paid' WHERE id = 2]"
+  User: "change the rest to Pending" 
+  -> UPDATE billing SET status = 'Pending' WHERE id != 2
+
+- History shows "updated record ID 5"
+  User: "leave that one, update the others to Overdue"
+  -> UPDATE billing SET status = 'Overdue' WHERE id != 5
+
+- History shows "changed status to Paid for id=2"
+  User: "keep that paid, mark others as pending"
+  -> UPDATE billing SET status = 'Pending' WHERE id != 2
+
+SIMPLE EXAMPLES:
+- "show pending bills" -> SELECT * FROM billing WHERE status = 'Pending'
+- "mark as paid" (after showing bill id=2) -> UPDATE billing SET status = 'Paid' WHERE id = 2
+- "add new patient John" -> INSERT INTO patients (name) VALUES ('John')
+
+COMPLEX JOIN/SUBQUERY EXAMPLES:
+- "show visits with patient names" -> SELECT v.*, p.name FROM visits v JOIN patients p ON v.patient_id = p.id
+- "patients with two visits" -> SELECT p.* FROM patients p WHERE p.id IN (SELECT patient_id FROM visits GROUP BY patient_id HAVING COUNT(*) = 2)
+- "full details of patient with id 1" -> SELECT p.*, v.date, v.diagnosis, v.doctor FROM patients p LEFT JOIN visits v ON p.id = v.patient_id WHERE p.id = 1
+- "all visits for patient John" -> SELECT v.* FROM visits v JOIN patients p ON v.patient_id = p.id WHERE p.name LIKE '%John%'
+- "patients who have visits" -> SELECT DISTINCT p.* FROM patients p INNER JOIN visits v ON p.id = v.patient_id
+- "count visits per patient" -> SELECT patient_id, COUNT(*) as visit_count FROM visits GROUP BY patient_id
+- "patients with more than one visit" -> SELECT p.* FROM patients p WHERE p.id IN (SELECT patient_id FROM visits GROUP BY patient_id HAVING COUNT(*) > 1)
+
+RELATIONSHIP NOTES:
+- visits.patient_id references patients.id
+- prescriptions.visit_id references visits.id  
+- billing.patient_id references patients.id
+- Use JOINs to connect related tables
+- Use subqueries with IN or EXISTS for filtering by related table conditions
 
 SQL RULES:
-1. Return ONLY the SQL query - no markdown, no explanation, no extra text
+1. Return ONLY ONE SQL query - no markdown, no explanation, no multiple statements
 2. For INSERT: NEVER include 'id' column (auto-generated)
 3. For UPDATE/DELETE: Always use WHERE clause
-4. Use date('now') for today's date
+4. NEVER use semicolons to separate multiple statements - only ONE statement allowed
+5. Use != for "not equal" / "except" conditions
+6. Use proper table aliases (p for patients, v for visits, etc.) in JOINs
 
 Generate the SQL query:"""
 
     response = llm.invoke([SystemMessage(content=prompt)])
     sql_query = response.content.strip()
+    
+    # Debug logging
+    print(f"[DEBUG] Raw LLM response: {sql_query[:500]}")
     
     # Cleanup possible markdown
     sql_query = sql_query.replace("```sql", "").replace("```", "").strip()
@@ -253,6 +379,11 @@ Generate the SQL query:"""
                 sql_query = line
                 break
     
+    # Ensure only one statement (remove anything after semicolon)
+    if ";" in sql_query:
+        sql_query = sql_query.split(";")[0].strip()
+    
+    print(f"[DEBUG] Final SQL query: {sql_query}")
     return {"sql_query": sql_query}
 
 
@@ -298,6 +429,7 @@ def execute_sql(state: AgentState):
         
         execution_result = ""
         table_changed = None
+        affected_ids = []
         
         if is_write:
             conn.commit()
@@ -309,6 +441,7 @@ def execute_sql(state: AgentState):
                 # Get more context about what was done
                 if "INSERT" in sql_query.upper():
                     last_id = cursor.lastrowid
+                    affected_ids = [last_id]
                     execution_result = f"Successfully created new record (ID: {last_id})."
                 elif "UPDATE" in sql_query.upper():
                     execution_result = f"Successfully updated {row_count} record(s)."
@@ -340,7 +473,8 @@ def execute_sql(state: AgentState):
         conn.close()
         return {
             "execution_result": execution_result, 
-            "table_changed": table_changed
+            "table_changed": table_changed,
+            "sql_query": sql_query  # Pass through for response context
         }
         
     except Exception as e:
@@ -353,6 +487,8 @@ def execute_sql(state: AgentState):
             return {"error": "Cannot complete this operation because it references a record that doesn't exist."}
         elif "no such column" in error_msg:
             return {"error": f"Invalid column reference in the query. Please check your field names."}
+        elif "only execute one statement" in error_msg.lower():
+            return {"error": "I can only run one database operation at a time. Please break this into separate requests."}
         return {"error": error_msg}
 
 
@@ -436,17 +572,22 @@ Respond conversationally:"""
                 elif "operation" in data[0]:
                     table_type = "audit"
                 
-                # Generate a natural summary
-                prompt = f"""Summarize this data briefly in 1 sentence:
-Data: {json.dumps(data[:3])}
-Count: {len(data)} records"""
-                
-                summary_response = llm.invoke([SystemMessage(content=prompt)])
+                # Generate simple summary without LLM (avoids Compound model reasoning)
+                count = len(data)
+                summary_templates = {
+                    "patients": f"Found {count} patient{'s' if count != 1 else ''}.",
+                    "visits": f"Found {count} visit{'s' if count != 1 else ''}.",
+                    "prescriptions": f"Found {count} prescription{'s' if count != 1 else ''}.",
+                    "billing": f"Found {count} billing record{'s' if count != 1 else ''}.",
+                    "audit": f"Found {count} audit log entr{'ies' if count != 1 else 'y'}.",
+                    "data": f"Found {count} record{'s' if count != 1 else ''}."
+                }
+                summary_text = summary_templates.get(table_type, f"{count} record{'s' if count != 1 else ''} found.")
                 
                 response_obj = {
                     "type": "table",
                     "table_type": table_type,
-                    "message": summary_response.content.strip(),
+                    "message": summary_text,
                     "data": data,
                     "count": len(data)
                 }

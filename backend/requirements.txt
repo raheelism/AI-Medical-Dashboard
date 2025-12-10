@@ -4,7 +4,9 @@ langgraph
 langchain
 langchain-groq
 langchain-community
+langchain-core
 python-dotenv
 websockets
 pydantic
 httpx
+groq
