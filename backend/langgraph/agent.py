@@ -207,35 +207,27 @@ USER REQUEST: "{last_message}"
 
 Analyze and respond with a JSON object containing:
 {{
-    "intent": "UPDATE" | "QUERY" | "CHAT",
+    "intent": "UPDATE" | "QUERY" | "CHAT" | "BULK_INSERT",
     "confidence": 0.0 to 1.0,
     "resolved_context": {{
         "table": "patients|visits|prescriptions|billing",
-        "action": "select|insert|update|delete",
+        "action": "select|insert|update|delete|bulk_insert",
         "inferred_from_history": "what you inferred from conversation history"
     }},
     "reasoning": "brief explanation"
 }}
 
-CRITICAL RULES - BE SMART ABOUT CONTEXT:
-1. ALWAYS use conversation history to resolve ambiguous references like "it", "that", "the same", "this one", etc.
-2. If user just discussed a specific record (e.g., a pending bill), and then says "change status to paid", ASSUME they mean that record
-3. If the last response showed query results, and user wants to modify something, use those results as context
-4. For simple queries like "show pending bills" - just execute it, don't ask for clarification
-5. ONLY set intent to require clarification if you truly cannot determine what the user wants even with history
-6. Be AGGRESSIVE about inferring intent - users don't like being asked obvious questions
-7. "pending bills" means billing table with status='Pending'
-8. If user refers to something from the previous message, USE THAT CONTEXT
+INTENT CLASSIFICATION:
+- "QUERY": Any SELECT operation (show, list, find, get, search, display, how many, count, etc.)
+- "UPDATE": Single INSERT, UPDATE, or DELETE operation
+- "BULK_INSERT": When user wants to add MULTIPLE records at once (e.g., "add 5 patients", "create dummy data", "populate with sample records", "add realistic test data")
+- "CHAT": Greetings, help requests, general questions not about data
 
-Examples of GOOD inference:
-- History shows "pending bill for patient 2", user says "mark it as paid" -> UPDATE billing SET status='Paid' WHERE patient_id=2 AND status='Pending'
-- History shows "1 record found with ID 2", user says "update that" -> refers to ID 2
-- User says "change the status to paid" after seeing pending bills -> update those pending bills
-
-NEVER ask for clarification if:
-- The answer is obvious from conversation history
-- It's a simple query (show, list, get, find)
-- User is referring to something just discussed
+CRITICAL RULES:
+1. Use conversation history to understand context ("it", "that one", "the same", etc.)
+2. Be aggressive about inferring intent - don't ask unnecessary questions
+3. For bulk data requests (add multiple records, dummy data, sample data, populate) -> use BULK_INSERT
+4. Simple queries should just execute, not ask for clarification
 
 Return ONLY the JSON object, no other text."""
 
@@ -254,17 +246,7 @@ Return ONLY the JSON object, no other text."""
         analysis = json.loads(response_text)
         
         intent = analysis.get("intent", "QUERY")
-        confidence = analysis.get("confidence", 0.8)  # Default higher confidence
         
-        # Handle chat/greeting
-        if intent == "CHAT":
-            return {
-                "intent": "CHAT",
-                "needs_clarification": False,
-                "context_data": context
-            }
-        
-        # For UPDATE and QUERY, proceed without clarification - let SQL generation handle it
         return {
             "intent": intent,
             "needs_clarification": False,
@@ -274,7 +256,7 @@ Return ONLY the JSON object, no other text."""
         
     except json.JSONDecodeError:
         # Fallback - just proceed with the request
-        intent = "QUERY" if any(w in last_message.lower() for w in ["show", "list", "get", "find", "search", "pending"]) else "UPDATE"
+        intent = "QUERY" if any(w in last_message.lower() for w in ["show", "list", "get", "find", "search"]) else "UPDATE"
         return {"intent": intent, "needs_clarification": False, "context_data": context}
 
 
@@ -556,8 +538,13 @@ Respond conversationally:"""
     # Handle successful operations with rich data
     if result:
         try:
-            # Try to parse as JSON (for query results)
+            # Try to parse as JSON (for query results or structured responses)
             data = json.loads(result)
+            
+            # Check if it's already a formatted response object (from seed_data, etc.)
+            if isinstance(data, dict) and "type" in data:
+                return {"messages": [HumanMessage(content=json.dumps(data))]}
+            
             if isinstance(data, list) and len(data) > 0:
                 # Determine the table type from the data structure
                 table_type = "data"
@@ -625,6 +612,89 @@ Respond conversationally:"""
     return {"messages": [HumanMessage(content=json.dumps(response_obj))]}
 
 
+def generate_bulk_insert(state: AgentState):
+    """Uses LLM to generate multiple INSERT statements for bulk data requests."""
+    messages = state["messages"]
+    last_message = messages[-1].content
+    context = state.get("context_data", "{}")
+    
+    prompt = f"""You are a data generator for a medical database. Generate realistic INSERT statements based on the user's request.
+
+DATABASE SCHEMA:
+- patients (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, age INTEGER, gender TEXT, address TEXT, phone TEXT, notes TEXT)
+- visits (id INTEGER PRIMARY KEY AUTOINCREMENT, patient_id INTEGER, date TEXT, diagnosis TEXT, doctor TEXT)
+- prescriptions (id INTEGER PRIMARY KEY AUTOINCREMENT, visit_id INTEGER, medication TEXT, dosage TEXT)
+- billing (id INTEGER PRIMARY KEY AUTOINCREMENT, patient_id INTEGER, amount REAL, status TEXT, date TEXT)
+  - status values: 'Pending', 'Paid', 'Overdue'
+
+CURRENT DATA (for reference - use existing patient IDs for visits/billing if needed):
+{context}
+
+USER REQUEST: "{last_message}"
+
+RULES:
+1. Generate realistic, varied data (different names, ages, conditions, etc.)
+2. NEVER include 'id' columns - they are auto-generated
+3. Use realistic medical data (proper diagnoses, medications, dosages)
+4. For dates, use format 'YYYY-MM-DD' and recent dates (2025)
+5. Return ONLY the SQL statements, one per line
+6. Each INSERT should be a complete, valid SQL statement
+7. If adding visits/prescriptions/billing, reference valid patient_ids from context or newly created patients
+8. For "dummy data" or "sample data" requests, add data to ALL tables with proper relationships
+
+Generate the INSERT statements:"""
+
+    response = llm.invoke([SystemMessage(content=prompt)])
+    sql_statements = response.content.strip()
+    
+    # Clean up the response
+    sql_statements = sql_statements.replace("```sql", "").replace("```", "").strip()
+    
+    # Split into individual statements and execute each
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    success_count = 0
+    errors = []
+    tables_affected = set()
+    
+    for line in sql_statements.split("\n"):
+        line = line.strip()
+        if line and line.upper().startswith("INSERT"):
+            # Remove trailing semicolon if present
+            if line.endswith(";"):
+                line = line[:-1]
+            try:
+                cursor.execute(line)
+                success_count += 1
+                # Track which table was affected
+                if "patients" in line.lower():
+                    tables_affected.add("patients")
+                elif "visits" in line.lower():
+                    tables_affected.add("visits")
+                elif "prescriptions" in line.lower():
+                    tables_affected.add("prescriptions")
+                elif "billing" in line.lower():
+                    tables_affected.add("billing")
+            except Exception as e:
+                errors.append(f"{line[:50]}... : {str(e)}")
+    
+    conn.commit()
+    conn.close()
+    
+    if success_count > 0:
+        table_list = ", ".join(tables_affected) if tables_affected else "database"
+        result_msg = f"Successfully created {success_count} new record(s) in {table_list}."
+        if errors:
+            result_msg += f" ({len(errors)} statements failed)"
+        return {
+            "execution_result": result_msg,
+            "table_changed": list(tables_affected)[0] if len(tables_affected) == 1 else "patients"
+        }
+    else:
+        return {"error": f"Failed to insert data. Errors: {'; '.join(errors[:3])}"}
+
+
 # --- Graph Construction ---
 workflow = StateGraph(AgentState)
 
@@ -634,6 +704,7 @@ workflow.add_node("validate", validate_operation)
 workflow.add_node("execute_sql", execute_sql)
 workflow.add_node("emit_event", emit_event)
 workflow.add_node("respond", generate_response)
+workflow.add_node("bulk_insert", generate_bulk_insert)
 
 workflow.set_entry_point("analyze")
 
@@ -643,10 +714,13 @@ def route_after_analysis(state: AgentState):
         return "respond"
     if state.get("intent") == "CHAT":
         return "respond"
+    if state.get("intent") == "BULK_INSERT":
+        return "bulk_insert"
     return "generate_sql"
 
 workflow.add_conditional_edges("analyze", route_after_analysis)
 workflow.add_edge("generate_sql", "validate")
+workflow.add_edge("bulk_insert", "emit_event")
 
 def route_after_validation(state: AgentState):
     """Routes based on validation results."""

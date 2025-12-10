@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from backend.db.connection import get_db_connection
+from backend.db.connection import get_db_connection, seed_realistic_data
 
 router = APIRouter()
 
@@ -37,3 +37,15 @@ def get_audit_log():
     logs = conn.execute("SELECT * FROM audit_log ORDER BY time DESC").fetchall()
     conn.close()
     return [dict(l) for l in logs]
+
+@router.post("/seed-data")
+def seed_data():
+    """Seeds the database with realistic dummy data."""
+    try:
+        result = seed_realistic_data()
+        return {
+            "success": True,
+            "message": f"Successfully added {result['patients']} patients, {result['visits']} visits, {result['prescriptions']} prescriptions, and {result['billing']} billing records."
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
